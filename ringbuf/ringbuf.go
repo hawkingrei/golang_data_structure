@@ -11,126 +11,143 @@ Thanks to https://fgiesen.wordpress.com/2010/12/14/ring-buffers-and-queues/ for 
 package ringbuffer
 
 import (
-	"io"
+	"runtime"
+	"sync/atomic"
 )
 
-// Start buffer at 64 bytes. This just seems like a reasonable minimum.
-const DefaultSize = 64
-
-// The zero value for Ring is an empty buffer ready to use.
-type Ring struct {
-	head uint
-	tail uint
-	data []byte
+// roundUp takes a uint64 greater than 0 and rounds it up to the next
+// power of 2.
+func roundUp(v uint64) uint64 {
+	v--
+	v |= v >> 1
+	v |= v >> 2
+	v |= v >> 4
+	v |= v >> 8
+	v |= v >> 16
+	v |= v >> 32
+	v++
+	return v
 }
 
-// Return the number of unread bytes in the buffer
-func (r *Ring) Len() int {
-	return int((r.head - r.tail) & r.mask())
+type node struct {
+	position uint64
+	data     interface{}
 }
 
-// Grow the buffer sufficiently so that you can write numBytes into it.
-// The returned slice is not guaranteed to be large enough to hold numBytes. If
-// the slice is not large enough, then it means that the requested range falls off the edge
-// of the circular buffer, and you'll need to call this twice.
-// Note that the slice returned points directly into the ring buffer.
-// After calling this function, the Len() will be increased by the length of the returned slice,
-// and the head of the buffer will point to the end of the slice.
-// This function exists because it makes it possible, in certain cases, to get away with fewer memory copies
-// than if you were to use the Write() interface.
-func (r *Ring) DirectWrite(numBytes int) []byte {
-	r.ensureCapacity(uint(r.Len() + numBytes))
-	if int(r.end()-r.head) < numBytes {
-		numBytes = int(r.end() - r.head)
-	}
-	slice := r.data[int(r.head) : int(r.head)+numBytes]
-	r.head = (r.head + uint(numBytes)) & r.mask()
-	return slice
+type nodes []*node
+
+// RingBuffer is a MPMC buffer that achieves threadsafety with CAS operations
+// only.  A put on full or get on empty call will block until an item
+// is put or retrieved.  Calling Dispose on the RingBuffer will unblock
+// any blocked threads with an error.  This buffer is similar to the buffer
+// described here: http://www.1024cores.net/home/lock-free-algorithms/queues/bounded-mpmc-queue
+// with some minor additions.
+type RingBuffer struct {
+	nodes                          nodes
+	queue, dequeue, mask, disposed uint64
 }
 
-// Reads the requested number of bytes, but possibly returns less than
-// the requested number. If Tail + numBytes wraps around, then the returned
-// slice will only contain bytes Capacity - Tail bytes. You need to perform
-// a subsequent read to read the remaining portion of the buffer.
-// Note that the slice returned points directly into the ring buffer.
-// This function exists because it makes it possible, in certain cases, to get away with fewer memory copies
-// than if you were to use the Read() interface.
-func (r *Ring) DirectRead(numBytes int) []byte {
-	if numBytes > r.Len() {
-		numBytes = r.Len()
+func (rb *RingBuffer) init(size uint64) {
+	size = roundUp(size)
+	rb.nodes = make(nodes, size)
+	for i := uint64(0); i < size; i++ {
+		rb.nodes[i] = &node{position: i}
 	}
-	if numBytes > int(r.end()-r.tail) {
-		numBytes = int(r.end() - r.tail)
-	}
-	if numBytes <= 0 {
-		return nil
-	}
-	res := r.data[r.tail : r.tail+uint(numBytes)]
-	r.tail = (r.tail + uint(numBytes)) & r.mask()
-	return res
+	rb.mask = size - 1 // so we don't have to do this with every put/get operation
 }
 
-// Implements io.Reader
-func (r *Ring) Read(b []byte) (int, error) {
-	s1 := r.DirectRead(len(b))
-	copy(b, s1)
-	s2 := r.DirectRead(len(b) - len(s1))
-	copy(b[len(s1):], s2)
+// Put adds the provided item to the queue.  If the queue is full, this
+// call will block until an item is added to the queue or Dispose is called
+// on the queue.  An error will be returned if the queue is disposed.
+func (rb *RingBuffer) Put(item interface{}) error {
+	var n *node
+	pos := atomic.LoadUint64(&rb.queue)
+L:
+	for {
+		if atomic.LoadUint64(&rb.disposed) == 1 {
+			return disposedError
+		}
 
-	total := len(s1) + len(s2)
-	if total == 0 && r.Len() == 0 {
-		return total, io.EOF
-	} else {
-		return total, nil
+		n = rb.nodes[pos&rb.mask]
+		seq := atomic.LoadUint64(&n.position)
+		switch dif := seq - pos; {
+		case dif == 0:
+			if atomic.CompareAndSwapUint64(&rb.queue, pos, pos+1) {
+				break L
+			}
+		case dif < 0:
+			panic(`Ring buffer in a compromised state during a put operation.`)
+		default:
+			pos = atomic.LoadUint64(&rb.queue)
+		}
+		runtime.Gosched() // free up the cpu before the next iteration
 	}
+
+	n.data = item
+	atomic.StoreUint64(&n.position, pos+1)
+	return nil
 }
 
-// Implements io.Writer
-func (r *Ring) Write(b []byte) (int, error) {
-	b1 := r.DirectWrite(len(b))
-	copy(b1, b)
-	if len(b1) != len(b) {
-		b2 := r.DirectWrite(len(b) - len(b1))
-		copy(b2, b[len(b1):])
+// Get will return the next item in the queue.  This call will block
+// if the queue is empty.  This call will unblock when an item is added
+// to the queue or Dispose is called on the queue.  An error will be returned
+// if the queue is disposed.
+func (rb *RingBuffer) Get() (interface{}, error) {
+	var n *node
+	pos := atomic.LoadUint64(&rb.dequeue)
+L:
+	for {
+		if atomic.LoadUint64(&rb.disposed) == 1 {
+			return nil, disposedError
+		}
+
+		n = rb.nodes[pos&rb.mask]
+		seq := atomic.LoadUint64(&n.position)
+		switch dif := seq - (pos + 1); {
+		case dif == 0:
+			if atomic.CompareAndSwapUint64(&rb.dequeue, pos, pos+1) {
+				break L
+			}
+		case dif < 0:
+			panic(`Ring buffer in compromised state during a get operation.`)
+		default:
+			pos = atomic.LoadUint64(&rb.dequeue)
+		}
+		runtime.Gosched() // free up cpu before next iteration
 	}
-	return len(b), nil
+	data := n.data
+	n.data = nil
+	atomic.StoreUint64(&n.position, pos+rb.mask+1)
+	return data, nil
 }
 
-// End of the buffer
-func (r *Ring) end() uint {
-	return uint(len(r.data))
+// Len returns the number of items in the queue.
+func (rb *RingBuffer) Len() uint64 {
+	return atomic.LoadUint64(&rb.queue) - atomic.LoadUint64(&rb.dequeue)
 }
 
-func (r *Ring) mask() uint {
-	return uint(len(r.data)) - 1
+// Cap returns the capacity of this ring buffer.
+func (rb *RingBuffer) Cap() uint64 {
+	return uint64(len(rb.nodes))
 }
 
-// Ensure our capacity is large enough to hold forBytes bytes. Grow by powers of 2.
-func (r *Ring) ensureCapacity(forBytes uint) {
-	// The +1 here is because we can only store len(r.data)-1 objects.
-	needCap := forBytes + uint(r.Len()) + 1
-	if needCap <= uint(len(r.data)) {
-		return
-	}
-	orgCap := uint(len(r.data))
-	cap := orgCap
-	if cap < DefaultSize {
-		cap = DefaultSize
-	}
-	for cap < needCap {
-		cap *= 2
-	}
-	extra := int(cap - orgCap)
-	for i := 0; i < extra; i++ {
-		r.data = append(r.data, 0)
-	}
-	if r.head < r.tail {
-		// Handle the scenario where the head is behind the tail (numerically)
-		// [  H T  ]   =>  [    T     H    ]
-		// [c - a b]   =>  [- - a b c - - -]
-		buf := r.data
-		copy(buf[orgCap:orgCap+r.head], buf[0:r.head])
-		r.head += orgCap
+// Dispose will dispose of this queue and free any blocked threads
+// in the Put and/or Get methods.  Calling those methods on a disposed
+// queue will return an error.
+func (rb *RingBuffer) Dispose() {
+	atomic.CompareAndSwapUint64(&rb.disposed, 0, 1)
+}
 
-	}
+// IsDisposed will return a bool indicating if this queue has been
+// disposed.
+func (rb *RingBuffer) IsDisposed() bool {
+	return atomic.LoadUint64(&rb.disposed) == 1
+}
+
+// NewRingBuffer will allocate, initialize, and return a ring buffer
+// with the specified size.
+func NewRingBuffer(size uint64) *RingBuffer {
+	rb := &RingBuffer{}
+	rb.init(size)
+	return rb
 }
